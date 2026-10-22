@@ -39,12 +39,16 @@ LLM.generate(prompts, SamplingParams)
 
 ## 适配硬件
 
-| 配置档 | 适配硬件 | 说明 |
-|---|---|---|
-| `deepinfer`（默认） | 对齐原版：NVIDIA SM100 级数据中心卡 / 华为 Ascend 950；本教学版实际可在任意 SM80 及以上 NVIDIA 卡与 CPU 上运行 | 默认档沿用原版的配置取向：bfloat16、单 batch 最多 256 条序列、16384 token 预算、显存利用率 0.9 |
-| `rtx3060` | GeForce RTX 3060（SM86，12GB）及以上消费卡，如 RTX 3060/3070/4060/4070 等 Ampere、Ada 及后续架构 | 针对 12GB 级单卡收紧的预设：float16、单 batch 最多 8 条序列、2048 token 预算、上下文上限 4096、显存利用率 0.85，启动时校验计算能力不低于 SM86 |
+本项目只有一个版本，不需要为不同显卡分档。原版 DeepInfer 要求 NVIDIA SM100 / 华为 Ascend 950，是因为它依赖 FlashMLA、DeepGEMM 等只为新架构编写的内核；本项目用纯 PyTorch 复刻这些内核的数学、CUDA 上统一用 bfloat16 计算，因此对卡型没有特殊要求：
 
-两点说明：其一，原版 DeepInfer 依赖 FlashMLA、DeepGEMM 等面向 SM100/Ascend 的内核，本项目用纯 PyTorch 复刻其数学，因此不挑卡型，代价是性能不与原版对标；其二，能否装得下取决于模型权重体积，与配置档无关——例如 DeepSeek-V2-Lite 的 bfloat16 权重约 31GB，超出 3060 的 12GB，这类模型请用默认档配合 24GB 以上显存的卡，或在 3060 上改用更小的同构检查点（按 `config.json` 缩小层数/维度自训或蒸馏的小模型均可直接加载）。
+| 环境 | 要求 |
+|---|---|
+| NVIDIA GPU | 计算能力 SM80 及以上均可，包括 RTX 3060（SM86）/3070/3090、RTX 40 系、A100/H100 以及 SM100 数据中心卡；有卡自动使用 |
+| CPU | 无显卡时自动退回 CPU（float32），适合小模型对照实验 |
+
+曾短暂提供过一个 `rtx3060` 配置档（float16 + 收紧的批量上限），在 RTX 3060 上与默认 bfloat16 配置做了同负载对照实测（3.4 亿参数同构模型、8 条序列 × 256 token、交替顺序多轮）：默认档 89.9 tok/s、3060 档 87.0~87.9 tok/s，差异在测量噪声范围内——因为两者共用同一套算子实现，分档并无性能收益，故已删除，只保留实测不慢且数值范围更好的默认配置。
+
+需要注意的是，能否装得下只取决于模型权重体积：例如 DeepSeek-V2-Lite 的 bfloat16 权重约 31GB，超出 RTX 3060 的 12GB，这类模型需 24GB 以上显存的卡；在 3060 上请改用更小的同构检查点（按 `config.json` 缩小层数/维度自训或蒸馏的小模型均可直接加载）。显存余量紧张时，可通过 `max_num_seqs`、`max_num_batched_tokens`、`max_model_len`、`gpu_memory_utilization` 调小批量与 KV cache 占用，见下方参数表。
 
 ## 快速开始
 
@@ -69,24 +73,17 @@ outputs = llm.generate(["请用一句话介绍深度学习推理框架。"], sam
 print(outputs[0]["text"])
 ```
 
-也可以直接运行仓库自带的脚本。默认使用 `deepinfer` 配置档（对齐原版面向数据中心卡的配置）；在 RTX 3060 等 SM86 及以上、12GB 级显卡上运行时，加上 `--profile rtx3060`（别名 `3060`、`sm86` 均可）：
+也可以直接运行仓库自带的脚本，任意 SM80 及以上显卡（包括 RTX 3060）上命令完全相同：
 
 ```bash
-# 默认档：数据中心卡 / 大显存
 python example.py --model deepseek-ai/DeepSeek-V2-Lite-Chat
-python bench.py --model deepseek-ai/DeepSeek-V2-Lite-Chat --num-seqs 16
-
-# RTX 3060（SM86）档：12GB 单卡
-python example.py --model /path/to/model --profile rtx3060
-python bench.py --model /path/to/model --profile 3060 --num-seqs 8
+python bench.py --model /path/to/model --num-seqs 16
 ```
 
-代码里同样可以选档，显式传入的参数会覆盖档位预设：
+在 RTX 3060 等 12GB 显存的卡上加载小模型时，建议把批量与上下文收紧以免显存溢出：
 
 ```python
-llm = LLM("/path/to/model", profile="rtx3060")                      # 3060 预设
-llm = LLM("/path/to/model", profile="rtx3060", max_num_seqs=4)      # 在预设之上微调
-llm = LLM("/path/to/model")                                          # 默认 deepinfer 档
+llm = LLM("/path/to/model", max_num_seqs=8, max_num_batched_tokens=2048, max_model_len=4096)
 ```
 
 无可用显卡时自动退回 CPU 运行（`device="cpu"`），适合对照代码做小模型实验。
@@ -97,8 +94,7 @@ llm = LLM("/path/to/model")                                          # 默认 de
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `profile` | `deepinfer` | 配置档：`deepinfer`（原版默认配置）或 `rtx3060`（别名 `3060`/`sm86`，RTX 3060 12GB 预设） |
-| `dtype` | `auto` | `auto` 时 CUDA 用 bfloat16、CPU 用 float32；`rtx3060` 档预设为 `float16` |
+| `dtype` | `auto` | `auto` 时 CUDA 用 bfloat16、CPU 用 float32；也可指定 `float16`/`bfloat16`/`float32` |
 | `max_num_seqs` | 256 | 单个 batch 内最大序列数 |
 | `max_num_batched_tokens` | 16384 | 单步最大 token 预算，决定分块 prefill 的切分 |
 | `max_model_len` | 取自 config | 最大上下文长度 |

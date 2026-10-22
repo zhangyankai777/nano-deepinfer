@@ -22,9 +22,6 @@ class ModelRunner:
         else:
             self.device = torch.device(config.device)
         torch.manual_seed(config.seed)
-        if self.device.type == "cuda" and config.profile == "rtx3060":
-            cap = torch.cuda.get_device_capability(self.device)
-            assert cap >= (8, 6), f"rtx3060 profile requires SM86+, got SM{cap[0]}{cap[1]}"
         if config.dtype == "auto":
             dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         else:
@@ -32,7 +29,7 @@ class ModelRunner:
         if self.device.type == "cuda":
             cap = torch.cuda.get_device_capability(self.device)
             name = torch.cuda.get_device_name(self.device)
-            print(f"[nano-deepinfer] profile={config.profile} device={name} SM{cap[0]}{cap[1]} dtype={dtype}")
+            print(f"[nano-deepinfer] device={name} SM{cap[0]}{cap[1]} dtype={dtype}")
         self.model = DeepseekForCausalLM(config.hf_config, config.max_model_len).to(dtype)
         load_weights(self.model, config.model)
         self.model.to(self.device).eval()

@@ -75,11 +75,5 @@ class LLMEngine:
 
 
 def config_from_kwargs(model: str, kwargs: dict) -> Config:
-    from nanodeepinfer.config import PROFILES, normalize_profile
-
     names = {f.name for f in fields(Config)} - {"hf_config", "eos"}
-    profile = normalize_profile(kwargs.get("profile", "deepinfer"))
-    merged = dict(PROFILES[profile])
-    merged.update({k: v for k, v in kwargs.items() if k in names})
-    merged["profile"] = profile
-    return Config(model=model, **merged)
+    return Config(model=model, **{k: v for k, v in kwargs.items() if k in names})
