@@ -37,6 +37,15 @@ LLM.generate(prompts, SamplingParams)
 | CUDA graph、`torch.compile` | ❌ 省略 | 默认 eager 执行，保证 CPU/GPU 行为一致 |
 | FP8 检查点 | ✅ 保留 | 加载时按 128×128 分块 scale 反量化，见 `utils/loader.py` |
 
+## 适配硬件
+
+| 配置档 | 适配硬件 | 说明 |
+|---|---|---|
+| `deepinfer`（默认） | 对齐原版：NVIDIA SM100 级数据中心卡 / 华为 Ascend 950；本教学版实际可在任意 SM80 及以上 NVIDIA 卡与 CPU 上运行 | 默认档沿用原版的配置取向：bfloat16、单 batch 最多 256 条序列、16384 token 预算、显存利用率 0.9 |
+| `rtx3060` | GeForce RTX 3060（SM86，12GB）及以上消费卡，如 RTX 3060/3070/4060/4070 等 Ampere、Ada 及后续架构 | 针对 12GB 级单卡收紧的预设：float16、单 batch 最多 8 条序列、2048 token 预算、上下文上限 4096、显存利用率 0.85，启动时校验计算能力不低于 SM86 |
+
+两点说明：其一，原版 DeepInfer 依赖 FlashMLA、DeepGEMM 等面向 SM100/Ascend 的内核，本项目用纯 PyTorch 复刻其数学，因此不挑卡型，代价是性能不与原版对标；其二，能否装得下取决于模型权重体积，与配置档无关——例如 DeepSeek-V2-Lite 的 bfloat16 权重约 31GB，超出 3060 的 12GB，这类模型请用默认档配合 24GB 以上显存的卡，或在 3060 上改用更小的同构检查点（按 `config.json` 缩小层数/维度自训或蒸馏的小模型均可直接加载）。
+
 ## 快速开始
 
 ### 安装
@@ -60,12 +69,27 @@ outputs = llm.generate(["请用一句话介绍深度学习推理框架。"], sam
 print(outputs[0]["text"])
 ```
 
-也可以直接运行仓库自带的脚本：
+也可以直接运行仓库自带的脚本。默认使用 `deepinfer` 配置档（对齐原版面向数据中心卡的配置）；在 RTX 3060 等 SM86 及以上、12GB 级显卡上运行时，加上 `--profile rtx3060`（别名 `3060`、`sm86` 均可）：
 
 ```bash
+# 默认档：数据中心卡 / 大显存
 python example.py --model deepseek-ai/DeepSeek-V2-Lite-Chat
 python bench.py --model deepseek-ai/DeepSeek-V2-Lite-Chat --num-seqs 16
+
+# RTX 3060（SM86）档：12GB 单卡
+python example.py --model /path/to/model --profile rtx3060
+python bench.py --model /path/to/model --profile 3060 --num-seqs 8
 ```
+
+代码里同样可以选档，显式传入的参数会覆盖档位预设：
+
+```python
+llm = LLM("/path/to/model", profile="rtx3060")                      # 3060 预设
+llm = LLM("/path/to/model", profile="rtx3060", max_num_seqs=4)      # 在预设之上微调
+llm = LLM("/path/to/model")                                          # 默认 deepinfer 档
+```
+
+无可用显卡时自动退回 CPU 运行（`device="cpu"`），适合对照代码做小模型实验。
 
 支持的检查点为 HuggingFace 格式的 DeepSeek-V2 / V3 家族模型（`config.json` + safetensors，含 FP8 权重），例如 DeepSeek-V2-Lite、DeepSeek-V3、DeepSeek-R1。模型结构由 `config.json` 字段驱动，改几个维度参数即可构造任意大小的同构模型做实验。
 
@@ -73,6 +97,8 @@ python bench.py --model deepseek-ai/DeepSeek-V2-Lite-Chat --num-seqs 16
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
+| `profile` | `deepinfer` | 配置档：`deepinfer`（原版默认配置）或 `rtx3060`（别名 `3060`/`sm86`，RTX 3060 12GB 预设） |
+| `dtype` | `auto` | `auto` 时 CUDA 用 bfloat16、CPU 用 float32；`rtx3060` 档预设为 `float16` |
 | `max_num_seqs` | 256 | 单个 batch 内最大序列数 |
 | `max_num_batched_tokens` | 16384 | 单步最大 token 预算，决定分块 prefill 的切分 |
 | `max_model_len` | 取自 config | 最大上下文长度 |
@@ -143,7 +169,7 @@ nanodeepinfer/
 
 ## 致谢与引用
 
-本项目为学习目的对 [DeepInfer](https://github.com/deepseek-ai/DeepInfer) 的简化再实现，与 DeepSeek 官方无关；组织方式借鉴了 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)。
+衷心感谢 DeepSeek 将 [DeepInfer](https://github.com/deepseek-ai/DeepInfer) 开源——把支撑其大规模线上服务的推理框架完整公开，极大地降低了普通开发者学习工业级推理系统的门槛。本项目正是在这一开源成果之上、为学习其设计而做的简化再实现，组织方式同时借鉴了 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)。DeepInfer 的设计与引用信息如下：
 
 ```bibtex
 @misc{deepinfer2026,

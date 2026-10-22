@@ -42,9 +42,27 @@ class ModelConfig:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
 
+PROFILE_ALIASES = {"3060": "rtx3060", "sm86": "rtx3060", "default": "deepinfer"}
+
+# deepinfer 为原版面向数据中心卡的默认档；rtx3060 面向 SM86 及以上、12GB 级消费卡：
+# 半精度计算、更小的批量与上下文上限，避免单卡显存溢出。显式传入的参数优先于档位预设。
+PROFILES: dict[str, dict] = {
+    "deepinfer": {},
+    "rtx3060": dict(dtype="float16", max_num_seqs=8, max_num_batched_tokens=2048,
+                    gpu_memory_utilization=0.85, max_model_len=4096),
+}
+
+
+def normalize_profile(profile: str) -> str:
+    profile = PROFILE_ALIASES.get(profile.lower(), profile.lower())
+    assert profile in PROFILES, f"unknown profile: {profile}, choose from {list(PROFILES)}"
+    return profile
+
+
 @dataclass
 class Config:
     model: str
+    profile: str = "deepinfer"
     max_num_seqs: int = 256
     max_num_batched_tokens: int = 16384
     max_model_len: int | None = None
@@ -53,6 +71,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     enforce_eager: bool = True
     device: str = "auto"
+    dtype: str = "auto"  # auto: CUDA 用 bfloat16、CPU 用 float32
     seed: int = 0
     eos: int = -1
     hf_config: ModelConfig = field(default_factory=ModelConfig)
@@ -68,7 +87,10 @@ class Config:
                 raw = json.load(f)
         known = {k: v for k, v in raw.items() if k in ModelConfig.__dataclass_fields__}
         self.hf_config = ModelConfig(**known)
+        self.profile = normalize_profile(self.profile)
         if self.max_model_len is None:
             self.max_model_len = self.hf_config.max_position_embeddings
+            if self.profile == "rtx3060":
+                self.max_model_len = min(self.max_model_len, PROFILES["rtx3060"]["max_model_len"])
         assert self.max_model_len >= 1
         assert self.kvcache_block_size >= 1

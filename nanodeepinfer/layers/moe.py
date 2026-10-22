@@ -36,7 +36,7 @@ class Gate(nn.Module):
         self.scaling = cfg.routed_scaling_factor
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = x.float() @ self.weight.t()
+        logits = x.float() @ self.weight.float().t()
         scores = torch.sigmoid(logits) if self.scoring == "sigmoid" else torch.softmax(logits, dim=-1)
         choice = scores + self.e_score_correction_bias if hasattr(self, "e_score_correction_bias") else scores
         if self.n_group > 1:
