@@ -19,6 +19,7 @@ class Context:
     is_prefill: bool
     seq_metas: list[SeqMeta] = field(default_factory=list)
     slot_mapping: torch.Tensor | None = None  # 每个待计算 token 在分页 KV cache 中的物理槽位
+    ngram_ids: torch.Tensor | None = None  # [n, max_ngram] Engram 的 n-gram 窗口（V4）
 
 
 _context: Context | None = None

@@ -1,6 +1,6 @@
 # Nano-DeepInfer
 
-一个极简、可读的 [DeepSeek DeepInfer](https://github.com/deepseek-ai/DeepInfer) 教学实现，仿照 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的做法：只保留推理框架的核心链路，用约 1100 行纯 PyTorch 代码把 DeepInfer 的请求生命周期、调度、KV cache 与 DeepSeek 标志性的 MLA + MoE 模型结构串起来，方便新手顺着一条主线读懂一个生产级推理框架是怎么工作的。
+一个极简、可读的 [DeepSeek DeepInfer](https://github.com/deepseek-ai/DeepInfer) 教学实现，仿照 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的做法：只保留推理框架的核心链路，用约 1600 行纯 PyTorch 代码把 DeepInfer 的请求生命周期、调度、KV cache 与 DeepSeek 标志性的模型结构串起来——V2/V3 的 MLA + MoE，以及 V4 的稀疏注意力 + mHC + Engram 三大新结构，方便新手顺着一条主线读懂一个生产级推理框架是怎么工作的。
 
 原版 DeepInfer 是 DeepSeek 支撑大规模线上服务的推理框架，包含 4 万余行 Python、C++/TileLang 内核、DeepEP/DeepGEMM/FlashMLA 等厂商级优化与 DP/EP/CP 并行。本项目在保持核心架构与链路完全对齐的前提下，用纯 PyTorch 复刻了其中的关键数学变换与调度决策，使其可以在一台普通机器上读完、跑通、改得动。
 
@@ -28,7 +28,11 @@ LLM.generate(prompts, SamplingParams)
           └─ ModelRunner    备张量 → 前向 → 采样                engine/model_runner.py
               └─ DeepseekForCausalLM                            models/deepseek.py
                   ├─ MLAAttention   低秩潜向量 KV 缓存 + 解耦 RoPE  layers/attention.py
-                  └─ MoE            分组受限 topk 路由 + 共享专家    layers/moe.py
+                  ├─ MoE            分组受限 topk 路由 + 共享专家    layers/moe.py
+                  └─ V4 分支（config 含 index_topk 时启用）
+                      ├─ V4SparseAttention  索引器稀疏 MLA   layers/attention_v4.py
+                      ├─ HCMix / HCHead     多路超连接 mHC   layers/hc.py
+                      └─ Engram             n-gram 条件记忆  layers/engram.py
 ```
 
 ## 链路详解：一个 token 从请求到输出的完整旅程
@@ -130,8 +134,12 @@ x = x + MoE(RMSNorm(x))        # 前馈子层（前 first_k_dense_replace 层是
 | KV cache 管理（原版未开源） | ✅ 补齐 | 分页块管理 + 链式哈希前缀缓存，思路与 vLLM 系一脉相承 |
 | MLA（多头潜注意力） | ✅ 保留 | KV cache 只存 `kv_lora_rank + qk_rope_head_dim` 维潜向量，注意力以吸收式在潜空间计算（`kv_b_proj` 的 K 部分吸收进 Q、V 部分在加权后作用），不还原完整 K/V |
 | MoE 路由 | ✅ 保留 | sigmoid 打分、校正偏置（noaux_tc 无辅助损失）、分组受限 topk、共享专家、前几层 dense；专家权重堆叠成批量矩阵乘，无逐专家循环、无动态形状，decode 可被 CUDA graph 捕获 |
+| V4 稀疏注意力 | ✅ 保留 | 索引器对全量缓存打分选 topk，主注意力只算选中位置；q 直接与潜向量内积（FlashMLA 布局），V 侧分组低秩；含 SWA 滑窗与 attention sink 选项 |
+| V4 mHC（多路超连接） | ✅ 保留 | 残差扩成 m 路 trunk，每子层 fn-GEMM + PolyNorm + sigmoid/sinkhorn 生成混合系数，pre 混单路、post 注回；含收尾 HCHead |
+| V4 Engram | ✅ 保留 | n-gram 哈希查稀疏嵌入表（随机奇数乘法因子 + 素数表长），fused 投影后与 HC trunk 门控融合；原版跨卡 DeepEP 取表简化为本地查表 |
 | 确定性采样（`seq_seed`） | ✅ 保留 | 温度/top-k/top-p 与原版同名字段 |
 | DeepGEMM / FlashMLA / TileLang 内核 | ❌ 简化为纯 PyTorch | 不写自定义内核，但保留其核心变换：MLA 吸收式潜空间注意力（`kv_b_proj` K 吸收进 Q、V 加权后作用）、q/kv 输入投影融合为一次 GEMM、MoE 专家权重堆叠批量矩阵乘；数学与原版等价 |
+| V4 索引器 FP4 量化、跨层共享、DFlash、YOCO | ❌ 省略 | 属内核与特性层优化，不影响对三大新结构主线的理解 |
 | DP / EP / CP 并行、EPLB | ❌ 省略 | 单机单卡路径；`Gate` 与专家的组织方式即为 EP 切分的天然位置 |
 | DSpark / MTP 投机解码 | ❌ 省略 | 原版在 `ModelRunner` 之上做草稿-验证，接口位置见下方扩展点 |
 | SWA bounded replay、结构化输出 | ❌ 省略 | 属于特性层，不影响主链路理解 |
@@ -148,12 +156,13 @@ x = x + MoE(RMSNorm(x))        # 前馈子层（前 first_k_dense_replace 层是
 | DeepSeek-V2 | `deepseek-ai/DeepSeek-V2(-Chat)` | 236B / 21B 激活 | |
 | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3(-0324)` | 671B / 37B 激活 | |
 | DeepSeek-V3 | `deepseek-ai/DeepSeek-R1(-0528)` 及同架构蒸馏版 | 671B / 37B 激活 | R1 与 V3 同架构 |
+| DeepSeek-V4 | 同构 `config.json`（含 `index_topk` 等字段） | — | 稀疏注意力 + mHC + Engram 全链路已实现；官方尚未发布公开检查点，可先按 V4 字段构造同构模型跑通链路 |
 | FP8 版 | 上述模型的 FP8 检查点 | 权重视体积减半 | 加载时自动按 128×128 分块反量化，无需离线转换 |
 
 两类补充说明：
 
 - **同构自定义小模型**：模型结构完全由 `config.json` 字段驱动，把层数、维度、专家数改小保存即可构造任意大小的 MLA+MoE 模型（随机权重也能跑通全链路）。上方性能基准使用的 3.4 亿参数模型就是这样构造的，适合无大显存时验证理解与测速；
-- **不支持的模型**：非 DeepSeek 架构（Qwen、Llama 等 dense/GQA 模型，请用 nano-vllm），以及 DeepSeek-V4 的专有新结构（原版 DeepInfer 服务的对象，本项目复刻的是其 V2/V3 前身主线）。
+- **不支持的模型**：非 DeepSeek 架构（Qwen、Llama 等 dense/GQA 模型，请用 nano-vllm）。
 
 显存门槛只取决于权重体积：bf16 权重 ≈ 2 字节/参数，V2-Lite 约 31GB 需 24GB 以上的卡；FP8 版减半。同构小模型任意显卡乃至纯 CPU 均可运行。
 
@@ -243,6 +252,9 @@ nanodeepinfer/
 ├─ models/deepseek.py      # DeepseekForCausalLM：embedding + N 层 + lm_head
 ├─ layers/
 │  ├─ attention.py         # MLA：潜向量缓存、解耦 RoPE、吸收式潜空间注意力
+│  ├─ attention_v4.py      # V4 稀疏注意力：索引器 topk 选路 + 潜空间主注意力
+│  ├─ hc.py                # V4 mHC：多路残差 trunk 的 pre/post 混合与 HCHead
+│  ├─ engram.py            # V4 Engram：n-gram 哈希查表 + 门控注入
 │  ├─ moe.py               # Gate（noaux_tc）+ routed/shared experts
 │  ├─ layernorm.py         # RMSNorm
 │  ├─ rotary_embedding.py  # DeepSeek 交错式 RoPE
@@ -260,6 +272,18 @@ nanodeepinfer/
 
 **3. 调度如何处理显存不足（`engine/scheduler.py`）。** decode 阶段某条序列需要新块而空闲块不足时，最晚运行的序列被抢占：释放其全部块、回到等待队列，之后从头重算。这与原版所依赖的思路相同——用重算换显存，实现简单且不会死锁。
 
+## V4 三大新结构
+
+`config.json` 中出现 `index_topk` 时模型自动走 V4 路径（`ModelConfig.is_v4`），与 V2/V3 共用同一套引擎。三者对应原版 `deepinfer/model_executor/models/v4_modules/`。
+
+**1. 稀疏注意力（`layers/attention_v4.py`）。** V3 的 MLA 让每个 query 与全部缓存潜向量计算；V4 在其上加了一个"索引器"：每个 query 先从 `q_B` 输出尾部分裂出几头低维 index q，与全量缓存潜向量投影出的 index k 打分（`relu(iq·ik)` 再按头加权求和），只保留 `index_topk` 个位置参与主注意力。长上下文下主注意力的计算量从 O(L) 降为 O(topk)。三个细节值得对照原版看：index k 由主潜向量投影而来（`use_kproj` 变体），不额外占缓存；RoPE 只加在尾部 `qk_rope_head_dim` 维；V 侧是分组低秩变换（`o_groups`/`o_lora_rank`），加权潜向量先过 Wv 再回 hidden。可选 SWA 滑窗（`window_size`）与 attention sink（softmax 多一列恒零"垃圾桶"位）也已实现。
+
+**2. mHC 多路超连接（`layers/hc.py`）。** 把单路残差 `x` 扩成 m 路 trunk `[n, m, h]` 在层间流动。每个子层（attn/ffn）配一组混合参数：trunk 拉平过一次 GEMM + PolyNorm（rms 归一），切出 pre/post/comb 三段系数——pre 经 sigmoid 加权把 m 路混成单路作为子层输入，子层输出 y 按 post 系数注入，trunk 自身按 comb 矩阵混合；comb 经 sinkhorn 迭代成双随机矩阵，保证多路混合时信息守恒（对应原版 `mhc_ops`）。初始化让残差近似恒等传递，混合交给 fn 学习。层末由 `HCHead` 把 trunk 混回单路接 lm_head。教学版未做原版的 hc_shifted 流水线变体。
+
+**3. Engram n-gram 条件记忆（`layers/engram.py`）。** 一个可学习的"查表记忆"：每个位置取以当前 token 结尾的 n-gram 窗口（2 阶、3 阶……），按每层随机奇数乘法因子做多项式哈希、对互不相同的素数表长取模，查出稀疏嵌入拼接后过 `fused_kv_projection`，再与 HC trunk 门控融合（门由 hidden 与嵌入共同算 sigmoid）。哈希乘法因子由 `seed + 10007 × layer_id` 的发生器导出、表长全局取素数去重——这两个约定与原版 `engram_metadata.py` 完全一致。原版的跨卡 DeepEP 取表与 CompressedTokenizer 词表压缩在此简化为本地查表与原始词表。
+
+**V4 路径的性能注记。** 教学版用纯 PyTorch 表达稀疏打分与多路混合：同尺寸随机模型实测（RTX 3060，8 条 × 128 token）V4 路径吞吐约为 V3 路径的 47%——原版靠 TileLang 内核（topk 内核、融合 mHC GEMM、FP4 索引缓存）才获得实际加速，这里保留的是结构与数学，读代码时重点看 `_sparse_mask` 的打分选路、`HCMix.pre/post` 的两次混合与 `NgramHash.hashes` 的哈希约定。
+
 ## 与 DeepInfer 的对应关系
 
 | 本项目文件 | DeepInfer 对应位置 |
@@ -270,11 +294,14 @@ nanodeepinfer/
 | `engine/model_runner.py` | `deepinfer/worker/model_runner.py` |
 | `models/deepseek.py` | `deepinfer/model_executor/models/deepseek.py` |
 | `layers/attention.py` | `deepinfer/model_executor/models/v4_modules/mla_attn.py` + FlashMLA |
+| `layers/attention_v4.py` | `deepinfer/model_executor/models/v4_modules/{attn,index_attn,mla_attn}.py` 的稀疏主线 |
+| `layers/hc.py` | `deepinfer/model_executor/models/v4_modules/{hc,mhc_ops,hc_blocks}.py` |
+| `layers/engram.py` | `deepinfer/model_executor/models/v4_modules/{engram,engram_metadata}.py` |
 | `layers/moe.py` | `deepinfer/model_executor/models/v4_modules/moe.py` + DeepEP |
 | `layers/sampler.py` | `deepinfer/model_executor/layers/sampler.py` |
 | `utils/loader.py` | `deepinfer/model_executor/model_loader.py` |
 
-注：DeepInfer 现服务于 DeepSeek-V4 家族，其注意力与专家系统由 V2/V3 的 MLA + MoE 演进而来。本项目以 V2/V3 家族检查点为载体复刻这条主线，因为同构的小模型（如 V2-Lite）可以在普通设备上真正跑起来验证理解；引擎侧的调度、KV 管理与采样链路与版本无关。
+注：DeepInfer 现服务于 DeepSeek-V4 家族。本项目同时复刻 V2/V3 的 MLA+MoE 主线与 V4 的三大新结构——前者有公开检查点（如 V2-Lite）可在普通设备上跑起来验证理解，后者按 `config.json` 字段构造同构模型即可走通全链路；引擎侧的调度、KV 管理与采样链路与版本无关。
 
 ## 适合继续练手的扩展点
 

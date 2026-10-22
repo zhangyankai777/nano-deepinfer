@@ -36,10 +36,43 @@ class ModelConfig:
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 2.5
     moe_layer_freq: int = 1
+    # ---- V4 家族（以下字段缺省时即 V2/V3 路径）----
+    # 稀疏注意力：index_topk>0 开启；索引器从主压缩 KV 投影（use_kproj 变体）
+    index_topk: int = 0
+    index_n_heads: int = 0
+    index_head_dim: int = 0
+    index_use_knorm: bool = False
+    use_qnorm: bool = False
+    o_groups: int = 0          # V 侧分组低秩；0 时退化为 V3 的 kv_b/o_proj
+    o_lora_rank: int = 0
+    window_size: int = -1      # SWA 滑窗；-1 关闭
+    attn_sink_init_value: float | None = None
+    # mHC（多路 Hyper-Connections）
+    hc_enabled: bool = False
+    hc_mult: int = 1
+    hc_dynamic_scale: float = 1.0
+    hc_pre_init_value: float = 1.0
+    hc_post_init_value: float = 1.0
+    hc_res_init_value: float = 1.0
+    hc_eps: float = 1e-6
+    hc_sinkhorn_iters: int = 10
+    hc_post_mult_value: float = 1.0
+    # Engram（n-gram 条件记忆，依赖 HC）
+    engram_layer_ids: list[int] | None = None
+    engram_max_ngram_size: int = 2
+    engram_vocab_size: list[int] | None = None      # 每阶哈希表基数（取素数）
+    n_embed_per_ngram: list[int] | None = None      # 每阶嵌入维（= n_head*head_dim）
+    n_head_per_ngram: list[int] | None = None
+    engram_eps: float = 1e-6
+    engram_clamp_value: float = 15.0
 
     @property
     def qk_head_dim(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    @property
+    def is_v4(self) -> bool:
+        return self.index_topk > 0 or self.hc_enabled
 
 
 @dataclass
