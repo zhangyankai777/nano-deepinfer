@@ -72,38 +72,24 @@ class MoE(nn.Module):
         return self._stacked
 
     def _routed(self, flat: torch.Tensor, idx: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """只计算被选中的专家：按专家排序后分组做 GEMM。
+        """全部专家堆叠成批量矩阵乘：无逐专家循环、无动态形状，decode 可被 CUDA graph 捕获。
 
-        循环次数固定为专家数（静态形状，可被 CUDA graph 捕获），
-        只算 top_k 选中的 token 组，避免对全部专家做无效计算。
+        代价是每个 token 对所有专家都算一遍（靠路由权重把未选专家置零），
+        换来的是大 GEMM 与零 CPU 同步；大批量时按行分块控制中间张量大小。
         """
         gate_up, down = self._stacked_weights()
-        num_tokens = flat.size(0)
-        flat_idx = idx.reshape(-1)
-        order = flat_idx.argsort(stable=True)
-        sorted_experts = flat_idx[order]
-        token_idx = order // self.gate.top_k
-        slot = order % self.gate.top_k
-        # 用 cumsum 算每个专家的起点（bincount 在 graph capture 时调 streamSync 报错）
-        E = gate_up.size(0)
-        onehot = torch.zeros(flat_idx.size(0), E, dtype=torch.int32, device=flat.device)
-        onehot.scatter_(1, flat_idx.unsqueeze(-1), 1)
-        counts = onehot.sum(0).long()
-        starts = torch.zeros(E, dtype=torch.long, device=flat.device)
-        starts[1:] = counts.cumsum(0)[:-1]
-        max_count = num_tokens * self.gate.top_k  # 静态上限
-        out = torch.zeros_like(flat)
-        for g in range(E):
-            positions = starts[g] + torch.arange(max_count, device=flat.device)
-            positions = torch.clamp(positions, max=max_count - 1)
-            valid = torch.arange(max_count, device=flat.device) < counts[g]
-            tokens = token_idx[positions]
-            h = torch.nn.functional.linear(flat[tokens], gate_up[g])
+        expert_w = torch.zeros(flat.size(0), gate_up.size(0), dtype=weights.dtype, device=flat.device)
+        expert_w.scatter_add_(1, idx, weights)
+        outs = []
+        for chunk in flat.split(1024):
+            w = expert_w[: chunk.size(0)]
+            expert_w = expert_w[chunk.size(0):]
+            h = torch.einsum("nh,eih->eni", chunk, gate_up)
             gate, up = h.chunk(2, dim=-1)
             h = torch.nn.functional.silu(gate) * up
-            h = torch.nn.functional.linear(h, down[g]) * weights[tokens, slot[positions]].unsqueeze(-1)
-            out.index_add_(0, tokens, h * valid.unsqueeze(-1))
-        return out
+            out_e = torch.einsum("eni,ehi->enh", h, down)
+            outs.append(torch.einsum("enh,ne->nh", out_e, w.to(h.dtype)))
+        return torch.cat(outs) if len(outs) > 1 else outs[0]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.view(-1, x.size(-1))
