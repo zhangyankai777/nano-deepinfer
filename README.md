@@ -1,6 +1,6 @@
 # Nano-DeepInfer
 
-一个极简、可读的 [DeepSeek DeepInfer](https://github.com/deepseek-ai/DeepInfer) 教学实现，仿照 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的做法：只保留推理框架的核心链路，用约 900 行纯 PyTorch 代码把 DeepInfer 的请求生命周期、调度、KV cache 与 DeepSeek 标志性的 MLA + MoE 模型结构串起来，方便新手顺着一条主线读懂一个生产级推理框架是怎么工作的。
+一个极简、可读的 [DeepSeek DeepInfer](https://github.com/deepseek-ai/DeepInfer) 教学实现，仿照 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的做法：只保留推理框架的核心链路，用约 1100 行纯 PyTorch 代码把 DeepInfer 的请求生命周期、调度、KV cache 与 DeepSeek 标志性的 MLA + MoE 模型结构串起来，方便新手顺着一条主线读懂一个生产级推理框架是怎么工作的。
 
 原版 DeepInfer 是 DeepSeek 支撑大规模线上服务的推理框架，包含 4 万余行 Python、C++/TileLang 内核、DeepEP/DeepGEMM/FlashMLA 等厂商级优化与 DP/EP/CP 并行。本项目在保持核心架构与链路完全对齐的前提下，用纯 PyTorch 复刻了其中的关键数学变换与调度决策，使其可以在一台普通机器上读完、跑通、改得动。
 
@@ -31,6 +31,95 @@ LLM.generate(prompts, SamplingParams)
                   └─ MoE            分组受限 topk 路由 + 共享专家    layers/moe.py
 ```
 
+## 链路详解：一个 token 从请求到输出的完整旅程
+
+下面按时间顺序讲解一次 `llm.generate(["你好"], SamplingParams(max_tokens=256))` 内部发生的每一件事。每一步都标注了对应的代码位置，建议对照源码阅读。
+
+### 第 0 步：引擎初始化（`LLM(...)`，只发生一次）
+
+```python
+llm = LLM("deepseek-ai/DeepSeek-V2-Lite-Chat")
+```
+
+1. 读模型的 `config.json`，解析出 MLA/MoE 的全部维度参数（`config.py` 的 `ModelConfig`）；
+2. 搭建 `DeepseekForCausalLM`，从 safetensors 加载权重——FP8 检查点在这一步按 128×128 分块反量化成 bf16（`utils/loader.py`）；
+3. **分配 KV cache**：按显存预算算出物理块数，申请 `num_blocks × 16槽 × 288维 × 层数` 的显存池（`model_runner.py` 的 `_allocate_kv_cache`）。注意 288 = `kv_lora_rank(256) + qk_rope_head_dim(32)`，与注意力头数无关——这是 MLA 省显存的关键；
+4. `Scheduler` 拿到块数，建 `BlockManager` 管理这个池子。
+
+### 第 1 步：请求进入（`llm_engine.py` 的 `add_request`）
+
+文本被分词器转成 token id 列表，包装成一个 `Sequence` 对象——它记录这条请求的一切：token 序列、`block_table`（逻辑块→物理块的映射，此时为空）、已缓存 token 数、采样参数。然后放入 `Scheduler.waiting` 队列等待调度。
+
+### 第 2 步：调度决策（`scheduler.py` 的 `schedule`，每个 step 开头执行一次）
+
+调度器每一步只回答一个问题：**这一步算谁、算多少？** 规则只有两条：
+
+- **prefill 优先**：`waiting` 里有新请求时，本步是 prefill 步。逐个询问 `BlockManager.can_allocate`：前缀缓存能命中几个整块？空闲块够不够装下整条序列？命中部分的 prefill 直接跳过；预算（`max_num_batched_tokens`）不够算完整个 prompt 时，只调度前一段（**分块 prefill**），剩下的下个 step 继续；
+- **无新请求才 decode**：`waiting` 空了，本步是 decode 步——`running` 中每条序列各推进 1 个 token。若某条序列需要新块而空闲块不足，**抢占**队尾序列：释放它的全部块、退回 `waiting`，之后从头重算（用重算换显存，实现简单且不死锁）。
+
+### 第 3 步：KV cache 分页与前缀缓存（`block_manager.py`）
+
+KV cache 像操作系统的内存一样分页管理：
+
+- 物理池切成固定大小的块（默认每块 16 个 token 槽位），每条序列持有一张 `block_table`，记录自己的第 i 个逻辑块放在哪个物理块上——序列逻辑上连续，物理上离散；
+- **前缀缓存**：每个写满的块计算链式哈希 `(父块哈希, 本块token)` 登记进哈希表。新请求若与已有序列共享前缀（比如相同的 system prompt），`can_allocate` 会命中这些块：引用计数 +1 直接复用，命中部分不用重算 prefill。
+
+### 第 4 步：prefill 执行（`model_runner.py` 的 `_run_prefill_batched`）
+
+本步调度的所有序列被**填充成矩形** `[B, S]`（B 条序列、S 为本步最长调度长度）一次算完：
+
+- 每行真实 token 的 KV 槽位指向自己的 `block_table`；填充行的槽位全部指向一块公共"草稿区"，其输出算完即弃——这样既不用变长 kernel，又不会污染缓存；
+- 一次前向后，取每行最后一个真实位置的 logits 送去采样，得到每条序列的第 1 个生成 token。
+
+### 第 5 步：模型前向内部（`models/deepseek.py`，每层 DecoderLayer 做两件事）
+
+```text
+x = x + MLA(RMSNorm(x))        # 注意力子层
+x = x + MoE(RMSNorm(x))        # 前馈子层（前 first_k_dense_replace 层是普通 MLP）
+```
+
+**MLA 注意力**（`layers/attention.py`，详见下文"值得细读的实现点"）：
+
+1. 输入经**一次融合 GEMM**同时得到 q 的低秩投影与 kv 投影（q_a 与 kv_a 权重已拼接）；
+2. kv 侧分出 `c_kv`（256 维潜向量）与 `k_pe`（32 维 RoPE 键），拼接后写入 KV cache 的本 token 槽位——**缓存里只有这 288 维，没有各头的 K/V**；
+3. q 侧升维后分两段：nope 段与 `kv_b_proj` 的 K 部分相乘得到 `q_abs`（把上投影"吸收"进 Q），rope 段加位置编码；
+4. 注意力直接在潜空间进行：`q_abs·c_kv + q_pe·k_pe` 得分数，softmax 加权 `c_kv`，最后才过 V 部分与 `o_proj` 回到隐藏维度。
+
+**MoE 前馈**（`layers/moe.py`）：
+
+1. `Gate` 对每个 token 打分（sigmoid + 校正偏置，即 DeepSeek 的无辅助损失路由），先按"组内 top2 之和"选出几个专家组，再在组内做 topk 选出 4 个专家；
+2. 16 个专家的权重预先堆叠成大三维张量，一次批量矩阵乘算完所有专家，再按路由权重加权求和——无逐专家循环、无动态形状，因此 decode 可以被 CUDA graph 捕获；
+3. 另有 1 个共享专家（普通 MLP）无条件参与，输出与路由专家相加。
+
+### 第 6 步：采样（`layers/sampler.py`）
+
+拿到 logits 后：全批贪心时只做一次 `argmax`；否则逐行做 温度缩放 → top-k 截断 → top-p 截断 → `multinomial`。指定 `seq_seed` 时用独立随机发生器，保证同参数结果可复现。
+
+### 第 7 步：后处理（`scheduler.py` 的 `postprocess`）
+
+采出的 token 追加进序列，然后判断结束条件：`max_tokens` 达到 / 采出 EOS / 命中 `stop_token_ids`。
+
+- 结束的序列：释放全部物理块（引用计数归零的块归还空闲池）；
+- 未结束的序列：留在 `running` 等下一个 decode 步；
+- 顺手把本步刚写满的块登记进前缀缓存哈希表——后续同前缀请求因此受益。
+
+### 第 8 步：decode 循环（`model_runner.py` 的 `_run_decode_graph`）
+
+接下来的每个 step 重复"调度 → 执行 → 采样 → 后处理"，区别在于输入形状完全静态（每条序列只有上一步采出的 1 个 token，即 `[B]`），因此整个前向被 **CUDA graph** 按 `(批大小, 块数桶)` 捕获，之后只更新输入缓冲、整条图一次重放——这就是 decode 快的原因。有人结束、有新序列 prefill 完毕加入时批大小变化，切换到对应的图即可（**连续批处理**）。
+
+### 第 9 步：输出
+
+所有序列结束后主循环退出，token id 经分词器解码成文本，连同 `token_ids`、`num_prompt_tokens` 一起返回。
+
+```text
+ step 0        step 1        step 2 ...      step N
+┌──────────┐  ┌──────────┐  ┌──────────┐   ┌──────────┐
+│ prefill  │  │ decode   │  │ decode   │...│ decode   │
+│ 8条×64tok│→ │ 8条×1tok │→ │ 8条×1tok │   │ 全部结束 │
+└──────────┘  └──────────┘  └──────────┘   └──────────┘
+   eager       CUDA graph    CUDA graph
+```
+
 ## 保留了什么，简化了什么
 
 | DeepInfer 的设计 | 本项目 | 说明 |
@@ -48,6 +137,25 @@ LLM.generate(prompts, SamplingParams)
 | SWA bounded replay、结构化输出 | ❌ 省略 | 属于特性层，不影响主链路理解 |
 | CUDA graph | ✅ 保留 | decode 走整批静态形状前向并按 (批量, 长度桶) 捕获重放；prefill 与 CPU 走 eager，`enforce_eager=True` 可关闭 |
 | FP8 检查点 | ✅ 保留 | 加载时按 128×128 分块 scale 反量化，见 `utils/loader.py` |
+
+## 支持的模型
+
+只要检查点是 **DeepSeek-V2 / V3 架构**（MLA + MoE）且为 HuggingFace 格式（`config.json` + safetensors），即可直接加载推理：
+
+| 家族 | 代表检查点 | 规模 | 说明 |
+|---|---|---|---|
+| DeepSeek-V2 | `deepseek-ai/DeepSeek-V2-Lite(-Chat)` | 16B 总参 / 2.4B 激活 | 最小的官方 MLA+MoE 检查点，教学演示首选 |
+| DeepSeek-V2 | `deepseek-ai/DeepSeek-V2(-Chat)` | 236B / 21B 激活 | |
+| DeepSeek-V3 | `deepseek-ai/DeepSeek-V3(-0324)` | 671B / 37B 激活 | |
+| DeepSeek-V3 | `deepseek-ai/DeepSeek-R1(-0528)` 及同架构蒸馏版 | 671B / 37B 激活 | R1 与 V3 同架构 |
+| FP8 版 | 上述模型的 FP8 检查点 | 权重视体积减半 | 加载时自动按 128×128 分块反量化，无需离线转换 |
+
+两类补充说明：
+
+- **同构自定义小模型**：模型结构完全由 `config.json` 字段驱动，把层数、维度、专家数改小保存即可构造任意大小的 MLA+MoE 模型（随机权重也能跑通全链路）。上方性能基准使用的 3.4 亿参数模型就是这样构造的，适合无大显存时验证理解与测速；
+- **不支持的模型**：非 DeepSeek 架构（Qwen、Llama 等 dense/GQA 模型，请用 nano-vllm），以及 DeepSeek-V4 的专有新结构（原版 DeepInfer 服务的对象，本项目复刻的是其 V2/V3 前身主线）。
+
+显存门槛只取决于权重体积：bf16 权重 ≈ 2 字节/参数，V2-Lite 约 31GB 需 24GB 以上的卡；FP8 版减半。同构小模型任意显卡乃至纯 CPU 均可运行。
 
 ## 适配硬件
 
@@ -100,9 +208,7 @@ python bench.py --model /path/to/model --num-seqs 16
 llm = LLM("/path/to/model", max_num_seqs=8, max_num_batched_tokens=2048, max_model_len=4096)
 ```
 
-无可用显卡时自动退回 CPU 运行（`device="cpu"`），适合对照代码做小模型实验。
-
-支持的检查点为 HuggingFace 格式的 DeepSeek-V2 / V3 家族模型（`config.json` + safetensors，含 FP8 权重），例如 DeepSeek-V2-Lite、DeepSeek-V3、DeepSeek-R1。模型结构由 `config.json` 字段驱动，改几个维度参数即可构造任意大小的同构模型做实验。
+无可用显卡时自动退回 CPU 运行（`device="cpu"`），适合对照代码做小模型实验。可加载的模型清单见上方"支持的模型"一节。
 
 ### `LLM` 常用参数
 
