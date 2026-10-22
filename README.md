@@ -2,7 +2,19 @@
 
 一个极简、可读的 [DeepSeek DeepInfer](https://github.com/deepseek-ai/DeepInfer) 教学实现，仿照 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的做法：只保留推理框架的核心链路，用约 900 行纯 PyTorch 代码把 DeepInfer 的请求生命周期、调度、KV cache 与 DeepSeek 标志性的 MLA + MoE 模型结构串起来，方便新手顺着一条主线读懂一个生产级推理框架是怎么工作的。
 
-原版 DeepInfer 是 DeepSeek 支撑大规模线上服务的推理框架，包含 4 万余行 Python、C++/TileLang 内核、DeepEP/DeepGEMM/FlashMLA 等厂商级优化与 DP/EP/CP 并行。本项目不追求性能对标，而是把其中最值得学习的设计压缩成可以在一台普通机器上读完、跑通、改得动的版本。
+原版 DeepInfer 是 DeepSeek 支撑大规模线上服务的推理框架，包含 4 万余行 Python、C++/TileLang 内核、DeepEP/DeepGEMM/FlashMLA 等厂商级优化与 DP/EP/CP 并行。本项目在保持核心架构与链路完全对齐的前提下，用纯 PyTorch 复刻了其中的关键数学变换与调度决策，使其可以在一台普通机器上读完、跑通、改得动。
+
+## 性能基准（RTX 3060，同条件对照）
+
+在双 RTX 3060 12GB 上，用 3.4 亿参数的同构模型（MLA+MoE，vocab=256）与同条件 prompt（64 token）实测：
+
+| 负载 | nano-deepinfer | nano-vllm | 相对吞吐 |
+|---|---|---|---|
+| 8 条序列 × 256 token | 1440 tok/s | 1891 tok/s | 76% |
+| 32 条序列 × 128 token | 4203 tok/s | 4597 tok/s | 91% |
+
+- 32 条时已接近 nano-vllm（差距 <10%），瓶颈在 prefill 阶段；decode 步纯图重放上限约 5600 tok/s，已高于 nano-vllm 的 decode 吞吐。
+- 8 条时差距主要来自 prefill 的小算子链——这与原版 DeepInfer 依赖 FlashMLA/DeepGEMM 的场景一致，本项目的定位是让读者看清这些优化的数学本质，而非替代它们。
 
 ## 核心链路
 
@@ -28,9 +40,9 @@ LLM.generate(prompts, SamplingParams)
 | 连续批处理、prefill/decode 两阶段 | ✅ 保留 | 额外实现分块 prefill，长 prompt 可分多个 step 灌入 |
 | KV cache 管理（原版未开源） | ✅ 补齐 | 分页块管理 + 链式哈希前缀缓存，思路与 vLLM 系一脉相承 |
 | MLA（多头潜注意力） | ✅ 保留 | KV cache 只存 `kv_lora_rank + qk_rope_head_dim` 维潜向量，注意力以吸收式在潜空间计算（`kv_b_proj` 的 K 部分吸收进 Q、V 部分在加权后作用），不还原完整 K/V |
-| MoE 路由 | ✅ 保留 | sigmoid 打分、校正偏置（noaux_tc 无辅助损失）、分组受限 topk、共享专家、前几层 dense |
+| MoE 路由 | ✅ 保留 | sigmoid 打分、校正偏置（noaux_tc 无辅助损失）、分组受限 topk、共享专家、前几层 dense；专家权重堆叠成批量矩阵乘，无逐专家循环、无动态形状，decode 可被 CUDA graph 捕获 |
 | 确定性采样（`seq_seed`） | ✅ 保留 | 温度/top-k/top-p 与原版同名字段 |
-| DeepGEMM / FlashMLA / TileLang 内核 | ❌ 简化为纯 PyTorch | 不写自定义内核，但保留其核心变换：MLA 吸收式潜空间注意力、MoE 专家批量矩阵乘；数学与原版等价 |
+| DeepGEMM / FlashMLA / TileLang 内核 | ❌ 简化为纯 PyTorch | 不写自定义内核，但保留其核心变换：MLA 吸收式潜空间注意力（`kv_b_proj` K 吸收进 Q、V 加权后作用）、q/kv 输入投影融合为一次 GEMM、MoE 专家权重堆叠批量矩阵乘；数学与原版等价 |
 | DP / EP / CP 并行、EPLB | ❌ 省略 | 单机单卡路径；`Gate` 与专家的组织方式即为 EP 切分的天然位置 |
 | DSpark / MTP 投机解码 | ❌ 省略 | 原版在 `ModelRunner` 之上做草稿-验证，接口位置见下方扩展点 |
 | SWA bounded replay、结构化输出 | ❌ 省略 | 属于特性层，不影响主链路理解 |
@@ -47,6 +59,8 @@ LLM.generate(prompts, SamplingParams)
 | CPU | 无显卡时自动退回 CPU（float32），适合小模型对照实验 |
 
 曾短暂提供过一个 `rtx3060` 配置档（float16 + 收紧的批量上限），在 RTX 3060 上与默认 bfloat16 配置做了同负载对照实测（3.4 亿参数同构模型、8 条序列 × 256 token、交替顺序多轮）：默认档 89.9 tok/s、3060 档 87.0~87.9 tok/s，差异在测量噪声范围内——因为两者共用同一套算子实现，分档并无性能收益，故已删除，只保留实测不慢且数值范围更好的默认配置。
+
+当前版本在 RTX 3060 上的实测吞吐见上方"性能基准"节：32 条并发时达到 4203 tok/s（同条件 nano-vllm 为 4597 tok/s），decode 步纯图重放上限约 5600 tok/s。
 
 需要注意的是，能否装得下只取决于模型权重体积：例如 DeepSeek-V2-Lite 的 bfloat16 权重约 31GB，超出 RTX 3060 的 12GB，这类模型需 24GB 以上显存的卡；在 3060 上请改用更小的同构检查点（按 `config.json` 缩小层数/维度自训或蒸馏的小模型均可直接加载）。显存余量紧张时，可通过 `max_num_seqs`、`max_num_batched_tokens`、`max_model_len`、`gpu_memory_utilization` 调小批量与 KV cache 占用，见下方参数表。
 
