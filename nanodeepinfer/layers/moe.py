@@ -84,14 +84,18 @@ class MoE(nn.Module):
         sorted_experts = flat_idx[order]
         token_idx = order // self.gate.top_k
         slot = order % self.gate.top_k
-        counts = torch.bincount(sorted_experts, minlength=gate_up.size(0))
-        starts = torch.zeros(gate_up.size(0), dtype=torch.long, device=flat.device)
+        # 用 cumsum 算每个专家的起点（bincount 在 graph capture 时调 streamSync 报错）
+        E = gate_up.size(0)
+        onehot = torch.zeros(flat_idx.size(0), E, dtype=torch.int32, device=flat.device)
+        onehot.scatter_(1, flat_idx.unsqueeze(-1), 1)
+        counts = onehot.sum(0).long()
+        starts = torch.zeros(E, dtype=torch.long, device=flat.device)
         starts[1:] = counts.cumsum(0)[:-1]
-        max_count = int(counts.max())
+        max_count = num_tokens * self.gate.top_k  # 静态上限
         out = torch.zeros_like(flat)
-        for g in range(gate_up.size(0)):
+        for g in range(E):
             positions = starts[g] + torch.arange(max_count, device=flat.device)
-            positions = torch.clamp(positions, max=num_tokens * self.gate.top_k - 1)
+            positions = torch.clamp(positions, max=max_count - 1)
             valid = torch.arange(max_count, device=flat.device) < counts[g]
             tokens = token_idx[positions]
             h = torch.nn.functional.linear(flat[tokens], gate_up[g])
