@@ -11,8 +11,8 @@ from nanodeepinfer.utils.loader import load_weights
 class ModelRunner:
     """单机版 Worker：备输入 -> 前向 -> 采样，对应原版 worker/model_runner.py 的主干。
 
-    原版在此之上叠了 CUDA graph、DP/EP/CP 通信与双后端 kernel 分发；
-    教学版只保留一台设备上的等价数据流，MLA 用纯 PyTorch 复刻 FlashMLA 的数学。
+    decode 走整批静态形状前向并以 CUDA graph 捕获重放（CPU 或 enforce_eager 时
+    回退同一前向的 eager 执行）；prefill 走 Context 路径，支持前缀缓存与分块。
     """
 
     def __init__(self, config: Config):
@@ -28,14 +28,14 @@ class ModelRunner:
             dtype = getattr(torch, config.dtype)
         if self.device.type == "cuda":
             cap = torch.cuda.get_device_capability(self.device)
-            name = torch.cuda.get_device_name(self.device)
-            print(f"[nano-deepinfer] device={name} SM{cap[0]}{cap[1]} dtype={dtype}")
+            print(f"[nano-deepinfer] device={torch.cuda.get_device_name(self.device)} SM{cap[0]}{cap[1]} dtype={dtype}")
         self.model = DeepseekForCausalLM(config.hf_config, config.max_model_len).to(dtype)
         load_weights(self.model, config.model)
         self.model.to(self.device).eval()
         self.sampler = Sampler()
         self.block_size = config.kvcache_block_size
         self.kv_caches = self._allocate_kv_cache(config, dtype)
+        self.graphs: dict[tuple[int, int], tuple] = {}
 
     def _allocate_kv_cache(self, config: Config, dtype: torch.dtype) -> list[torch.Tensor]:
         cfg = config.hf_config
@@ -50,8 +50,10 @@ class ModelRunner:
             per_block = self.block_size * latent * dtype.itemsize * cfg.num_hidden_layers
             num_blocks = max(64, budget // per_block)
         config.num_kvcache_blocks = num_blocks
-        shape = (num_blocks, self.block_size, latent)
-        return [torch.empty(shape, dtype=dtype, device=self.device) for _ in range(cfg.num_hidden_layers)]
+        self.scratch_slot = num_blocks * self.block_size  # 额外一块草稿区，承接整批 prefill 的填充行
+        shape = (num_blocks + 1, self.block_size, latent)
+        # 必须零初始化：被注意力 mask 掉的位置仍会参与矩阵乘，未写入槽位若是 NaN 会经 0*NaN 污染结果
+        return [torch.zeros(shape, dtype=dtype, device=self.device) for _ in range(cfg.num_hidden_layers)]
 
     def _slots(self, seq: Sequence, start: int, length: int) -> list[int]:
         slots = []
@@ -62,24 +64,32 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int | None]:
+        if is_prefill:
+            return self._run_prefill(seqs)
+        if self.device.type == "cuda" and not self.config.enforce_eager:
+            logits = self._run_decode_graph(seqs)
+        else:
+            logits = self._run_decode_eager(seqs)
+        return self.sampler.forward(logits, [s.sampling_params for s in seqs])
+
+    @torch.inference_mode()
+    def _run_prefill(self, seqs: list[Sequence]) -> list[int | None]:
+        if all(s.num_cached_tokens + s.num_scheduled_tokens == s.num_tokens for s in seqs):
+            return self._run_prefill_batched(seqs)
         input_ids, positions, slots, metas, last_mask = [], [], [], [], []
         sample_seqs: list[Sequence] = []
         for seq in seqs:
-            start = seq.num_cached_tokens
-            length = seq.num_scheduled_tokens
-            if is_prefill:
-                input_ids.extend(seq.token_ids[start: start + length])
-            else:
-                input_ids.append(seq.last_token)
+            start, length = seq.num_cached_tokens, seq.num_scheduled_tokens
+            input_ids.extend(seq.token_ids[start: start + length])
             positions.extend(range(start, start + length))
             slots.extend(self._slots(seq, start, length))
             metas.append(SeqMeta(seq.block_table, start, length))
-            done = (start + length == seq.num_tokens) if is_prefill else True
+            done = start + length == seq.num_tokens
             last_mask.extend([False] * (length - 1) + [done])
             if done:
                 sample_seqs.append(seq)
         t = lambda v: torch.tensor(v, device=self.device)
-        set_context(Context(is_prefill, metas, t(slots)))
+        set_context(Context(True, metas, t(slots)))
         logits = self.model(t(input_ids), t(positions), self.kv_caches, t(last_mask))
         reset_context()
         sampled = self.sampler.forward(logits, [s.sampling_params for s in sample_seqs])
@@ -89,3 +99,82 @@ class ModelRunner:
             if seq in sample_seqs:
                 result[i] = next(it)
         return result
+
+    @torch.inference_mode()
+    def _run_prefill_batched(self, seqs: list[Sequence]) -> list[int | None]:
+        bs, smax = len(seqs), max(s.num_scheduled_tokens for s in seqs)
+        max_blocks = max(len(s.block_table) for s in seqs)
+        input_ids = [[0] * smax for _ in range(bs)]
+        positions = [[0] * smax for _ in range(bs)]
+        slots = [[self.scratch_slot] * smax for _ in range(bs)]
+        block_tables = [[0] * max_blocks for _ in range(bs)]
+        for i, s in enumerate(seqs):
+            start, length = s.num_cached_tokens, s.num_scheduled_tokens
+            input_ids[i][:length] = s.token_ids[start: start + length]
+            positions[i][:length] = range(start, start + length)
+            if length < smax:
+                positions[i][length:] = [start + length - 1] * (smax - length)
+            slots[i][:length] = self._slots(s, start, length)
+            block_tables[i][: len(s.block_table)] = s.block_table
+        t = lambda v: torch.tensor(v, device=self.device)
+        logits = self.model.forward_prefill_batched(
+            t(input_ids), t(positions), t(block_tables),
+            t([s.num_cached_tokens for s in seqs]), t([s.num_scheduled_tokens for s in seqs]),
+            t(slots), self.kv_caches)
+        return self.sampler.forward(logits, [s.sampling_params for s in seqs])
+
+    def _decode_inputs(self, seqs: list[Sequence]):
+        bs = len(seqs)
+        max_blocks = max(len(s.block_table) for s in seqs)
+        bucket_blocks = 1 << (max_blocks - 1).bit_length()
+        input_ids = [s.last_token for s in seqs]
+        positions = [s.num_cached_tokens for s in seqs]
+        context_lens = [p + 1 for p in positions]
+        slots = [s.block_table[p // self.block_size] * self.block_size + p % self.block_size
+                 for s, p in zip(seqs, positions)]
+        block_tables = [[0] * bucket_blocks for _ in range(bs)]
+        for i, s in enumerate(seqs):
+            block_tables[i][: len(s.block_table)] = s.block_table
+        return bucket_blocks, input_ids, positions, context_lens, slots, block_tables
+
+    @torch.inference_mode()
+    def _run_decode_eager(self, seqs: list[Sequence]) -> torch.Tensor:
+        _, input_ids, positions, context_lens, slots, block_tables = self._decode_inputs(seqs)
+        t = lambda v: torch.tensor(v, device=self.device)
+        return self.model.forward_decode(t(input_ids), t(positions), t(block_tables), t(context_lens), t(slots), self.kv_caches)
+
+    @torch.inference_mode()
+    def _run_decode_graph(self, seqs: list[Sequence]) -> torch.Tensor:
+        bucket_blocks, input_ids, positions, context_lens, slots, block_tables = self._decode_inputs(seqs)
+        key = (len(seqs), bucket_blocks)
+        if key not in self.graphs:
+            self._capture(key, bucket_blocks)
+        graph, buffers, logits = self.graphs[key]
+        t = lambda v: torch.tensor(v, device=self.device)
+        buffers["input_ids"].copy_(t(input_ids))
+        buffers["positions"].copy_(t(positions))
+        buffers["context_lens"].copy_(t(context_lens))
+        buffers["slot_mapping"].copy_(t(slots))
+        buffers["block_tables"].copy_(t(block_tables))
+        graph.replay()
+        return logits
+
+    def _capture(self, key: tuple[int, int], bucket_blocks: int):
+        bs = key[0]
+        buffers = {
+            "input_ids": torch.zeros(bs, dtype=torch.long, device=self.device),
+            "positions": torch.zeros(bs, dtype=torch.long, device=self.device),
+            "context_lens": torch.ones(bs, dtype=torch.long, device=self.device),
+            "slot_mapping": torch.zeros(bs, dtype=torch.long, device=self.device),
+            "block_tables": torch.zeros(bs, bucket_blocks, dtype=torch.long, device=self.device),
+        }
+        args = (buffers["input_ids"], buffers["positions"], buffers["block_tables"],
+                buffers["context_lens"], buffers["slot_mapping"], self.kv_caches)
+        fn = self.model.forward_decode
+        for _ in range(3):
+            fn(*args)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = fn(*args)
+        self.graphs[key] = (graph, buffers, logits)

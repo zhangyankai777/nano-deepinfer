@@ -21,6 +21,19 @@ class DecoderLayer(nn.Module):
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
+    def decode(self, x: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
+               context_lens: torch.Tensor, slot_mapping: torch.Tensor, kv_cache: torch.Tensor) -> torch.Tensor:
+        x = x + self.self_attn.decode(self.input_layernorm(x), positions, block_tables, context_lens, slot_mapping, kv_cache)
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
+
+    def prefill_batched(self, x: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
+                        cached_lens: torch.Tensor, new_lens: torch.Tensor, slot_mapping: torch.Tensor,
+                        kv_cache: torch.Tensor) -> torch.Tensor:
+        x = x + self.self_attn.prefill_batched(self.input_layernorm(x), positions, block_tables, cached_lens, new_lens, slot_mapping, kv_cache)
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
+
 
 class DeepseekModel(nn.Module):
     def __init__(self, cfg: ModelConfig, max_len: int):
@@ -33,6 +46,21 @@ class DeepseekModel(nn.Module):
         x = self.embed_tokens(input_ids)
         for layer, cache in zip(self.layers, kv_caches):
             x = layer(x, positions, cache)
+        return self.norm(x)
+
+    def decode(self, input_ids: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
+               context_lens: torch.Tensor, slot_mapping: torch.Tensor, kv_caches: list[torch.Tensor]) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        for layer, cache in zip(self.layers, kv_caches):
+            x = layer.decode(x, positions, block_tables, context_lens, slot_mapping, cache)
+        return self.norm(x)
+
+    def prefill_batched(self, input_ids: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
+                        cached_lens: torch.Tensor, new_lens: torch.Tensor, slot_mapping: torch.Tensor,
+                        kv_caches: list[torch.Tensor]) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        for layer, cache in zip(self.layers, kv_caches):
+            x = layer.prefill_batched(x, positions, block_tables, cached_lens, new_lens, slot_mapping, cache)
         return self.norm(x)
 
 
@@ -51,3 +79,15 @@ class DeepseekForCausalLM(nn.Module):
         if last_token_mask is not None:  # 分块 prefill 时只有收尾的序列需要 logits
             x = x[last_token_mask]
         return self.lm_head(x)
+
+    def forward_prefill_batched(self, input_ids: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
+                                cached_lens: torch.Tensor, new_lens: torch.Tensor, slot_mapping: torch.Tensor,
+                                kv_caches: list[torch.Tensor]) -> torch.Tensor:
+        x = self.model.prefill_batched(input_ids, positions, block_tables, cached_lens, new_lens, slot_mapping, kv_caches)
+        last = x[torch.arange(x.size(0), device=x.device), new_lens - 1]
+        return self.lm_head(last)
+
+    def forward_decode(self, input_ids: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
+                       context_lens: torch.Tensor, slot_mapping: torch.Tensor,
+                       kv_caches: list[torch.Tensor]) -> torch.Tensor:
+        return self.lm_head(self.model.decode(input_ids, positions, block_tables, context_lens, slot_mapping, kv_caches))

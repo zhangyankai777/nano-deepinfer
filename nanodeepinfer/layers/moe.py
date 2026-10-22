@@ -19,8 +19,8 @@ class MLP(nn.Module):
 class Gate(nn.Module):
     """V3 的无辅助损失路由：sigmoid 打分 + 校正偏置选专家，权重仍取原始打分。
 
-    原版用 DeepEP 做跨卡专家通信、EPLB 做专家冗余重排；单机教学版保留
-    分组受限 topk 的选择逻辑本身，专家计算退化为本地循环。
+    原版用 DeepEP 做跨卡专家通信、EPLB 做专家冗余重排；单机版保留
+    分组受限 topk 的选择逻辑本身，专家计算在本地完成。
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -36,7 +36,7 @@ class Gate(nn.Module):
         self.scaling = cfg.routed_scaling_factor
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = x.float() @ self.weight.float().t()
+        logits = (x @ self.weight.t()).float()
         scores = torch.sigmoid(logits) if self.scoring == "sigmoid" else torch.softmax(logits, dim=-1)
         choice = scores + self.e_score_correction_bias if hasattr(self, "e_score_correction_bias") else scores
         if self.n_group > 1:
@@ -59,15 +59,39 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([MLP(cfg.hidden_size, cfg.moe_intermediate_size) for _ in range(cfg.n_routed_experts)])
         if cfg.n_shared_experts:
             self.shared_experts = MLP(cfg.hidden_size, cfg.moe_intermediate_size * cfg.n_shared_experts)
+        self._stacked: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _stacked_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._stacked is None:  # 权重加载完成后一次性堆叠，之后地址不变，可被 CUDA graph 捕获
+            gate_up = torch.stack([torch.cat([e.gate_proj.weight, e.up_proj.weight]) for e in self.experts])
+            down = torch.stack([e.down_proj.weight for e in self.experts])
+            self._stacked = (gate_up, down)
+        return self._stacked
+
+    def _routed(self, flat: torch.Tensor, idx: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """全部专家堆叠成批量矩阵乘：无逐专家循环、无动态形状，decode 可被 CUDA graph 捕获。
+
+        代价是每个 token 对所有专家都算一遍（靠路由权重把未选专家置零），
+        换来的是大 GEMM 与零 CPU 同步；大批量时按行分块控制中间张量大小。
+        """
+        gate_up, down = self._stacked_weights()
+        expert_w = torch.zeros(flat.size(0), gate_up.size(0), dtype=weights.dtype, device=flat.device)
+        expert_w.scatter_add_(1, idx, weights)
+        outs = []
+        for chunk in flat.split(1024):
+            w = expert_w[: chunk.size(0)]
+            expert_w = expert_w[chunk.size(0):]
+            h = torch.einsum("nh,eih->eni", chunk, gate_up)
+            gate, up = h.chunk(2, dim=-1)
+            h = torch.nn.functional.silu(gate) * up
+            out_e = torch.einsum("eni,ehi->enh", h, down)
+            outs.append(torch.einsum("enh,ne->nh", out_e, w.to(h.dtype)))
+        return torch.cat(outs) if len(outs) > 1 else outs[0]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.view(-1, x.size(-1))
         idx, weights = self.gate(flat)
-        out = torch.zeros_like(flat)
-        for e, expert in enumerate(self.experts):
-            token_idx, slot = (idx == e).nonzero(as_tuple=True)
-            if token_idx.numel():
-                out.index_add_(0, token_idx, expert(flat[token_idx]) * weights[token_idx, slot].unsqueeze(-1))
+        out = self._routed(flat, idx, weights)
         if hasattr(self, "shared_experts"):
             out = out + self.shared_experts(flat)
         return out.view_as(x)

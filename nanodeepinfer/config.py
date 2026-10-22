@@ -51,7 +51,7 @@ class Config:
     kvcache_block_size: int = 16
     num_kvcache_blocks: int = -1  # -1 表示由 ModelRunner 按可用内存推导
     gpu_memory_utilization: float = 0.9
-    enforce_eager: bool = True
+    enforce_eager: bool = False  # False 时 decode 用 CUDA graph 捕获重放（仅 CUDA）
     device: str = "auto"
     dtype: str = "auto"  # auto: CUDA 用 bfloat16、CPU 用 float32
     seed: int = 0

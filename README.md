@@ -27,14 +27,14 @@ LLM.generate(prompts, SamplingParams)
 | 引擎主循环与异步调度 | ✅ 简化 | 保留准入/批处理/抢占决策，去掉 CPU 调度与设备执行的异步重叠 |
 | 连续批处理、prefill/decode 两阶段 | ✅ 保留 | 额外实现分块 prefill，长 prompt 可分多个 step 灌入 |
 | KV cache 管理（原版未开源） | ✅ 补齐 | 分页块管理 + 链式哈希前缀缓存，思路与 vLLM 系一脉相承 |
-| MLA（多头潜注意力） | ✅ 保留 | KV cache 只存 `kv_lora_rank + qk_rope_head_dim` 维潜向量，用时上投影还原 K/V |
+| MLA（多头潜注意力） | ✅ 保留 | KV cache 只存 `kv_lora_rank + qk_rope_head_dim` 维潜向量，注意力以吸收式在潜空间计算（`kv_b_proj` 的 K 部分吸收进 Q、V 部分在加权后作用），不还原完整 K/V |
 | MoE 路由 | ✅ 保留 | sigmoid 打分、校正偏置（noaux_tc 无辅助损失）、分组受限 topk、共享专家、前几层 dense |
 | 确定性采样（`seq_seed`） | ✅ 保留 | 温度/top-k/top-p 与原版同名字段 |
-| DeepGEMM / FlashMLA / TileLang 内核 | ❌ 简化为纯 PyTorch | 数学等价、便于阅读；MLA 每步对已缓存潜向量做上投影而非在潜空间直接计算注意力 |
+| DeepGEMM / FlashMLA / TileLang 内核 | ❌ 简化为纯 PyTorch | 不写自定义内核，但保留其核心变换：MLA 吸收式潜空间注意力、MoE 专家批量矩阵乘；数学与原版等价 |
 | DP / EP / CP 并行、EPLB | ❌ 省略 | 单机单卡路径；`Gate` 与专家的组织方式即为 EP 切分的天然位置 |
 | DSpark / MTP 投机解码 | ❌ 省略 | 原版在 `ModelRunner` 之上做草稿-验证，接口位置见下方扩展点 |
 | SWA bounded replay、结构化输出 | ❌ 省略 | 属于特性层，不影响主链路理解 |
-| CUDA graph、`torch.compile` | ❌ 省略 | 默认 eager 执行，保证 CPU/GPU 行为一致 |
+| CUDA graph | ✅ 保留 | decode 走整批静态形状前向并按 (批量, 长度桶) 捕获重放；prefill 与 CPU 走 eager，`enforce_eager=True` 可关闭 |
 | FP8 检查点 | ✅ 保留 | 加载时按 128×128 分块 scale 反量化，见 `utils/loader.py` |
 
 ## 适配硬件
@@ -67,7 +67,7 @@ pip install .
 ```python
 from nanodeepinfer import LLM, SamplingParams
 
-llm = LLM("deepseek-ai/DeepSeek-V2-Lite-Chat", enforce_eager=True, max_num_seqs=16)
+llm = LLM("deepseek-ai/DeepSeek-V2-Lite-Chat", max_num_seqs=16)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 outputs = llm.generate(["请用一句话介绍深度学习推理框架。"], sampling_params)
 print(outputs[0]["text"])
@@ -122,7 +122,7 @@ nanodeepinfer/
 │  └─ model_runner.py      # 输入准备、KV cache 分配、执行与采样调度
 ├─ models/deepseek.py      # DeepseekForCausalLM：embedding + N 层 + lm_head
 ├─ layers/
-│  ├─ attention.py         # MLA：潜向量缓存、解耦 RoPE、上投影注意力
+│  ├─ attention.py         # MLA：潜向量缓存、解耦 RoPE、吸收式潜空间注意力
 │  ├─ moe.py               # Gate（noaux_tc）+ routed/shared experts
 │  ├─ layernorm.py         # RMSNorm
 │  ├─ rotary_embedding.py  # DeepSeek 交错式 RoPE
@@ -134,7 +134,7 @@ nanodeepinfer/
 
 ## 三个值得细读的实现点
 
-**1. MLA 如何省 KV cache（`layers/attention.py`）。** 每个 token 不存各头的完整 K/V，而是存一个 `kv_lora_rank` 维的压缩潜向量加一份共享的 RoPE 键。缓存占用与头数无关，这是 DeepSeek 模型能把 KV cache 压到传统 MHA 几十分之一的关键。读代码时重点看 `kv_a_proj_with_mqa` 的写缓存与 `kv_b_proj` 的读时上投影。
+**1. MLA 如何省 KV cache（`layers/attention.py`）。** 每个 token 不存各头的完整 K/V，而是存一个 `kv_lora_rank` 维的压缩潜向量加一份共享的 RoPE 键。缓存占用与头数无关，这是 DeepSeek 模型能把 KV cache 压到传统 MHA 几十分之一的关键。计算时不还原 K/V：`kv_b_proj` 生成 K 的部分被吸收进 Q、生成 V 的部分在注意力加权之后才作用于潜向量，这正是 FlashMLA 采用的等价变换。读代码时重点看 `kv_a_proj_with_mqa` 的写缓存与 `_projections` 的吸收。
 
 **2. 前缀缓存如何复用（`engine/block_manager.py`）。** 每个写满的块以 `(父块哈希, 本块 token)` 做链式哈希，相同前缀的请求可以直接引用已有块并跳过这部分 prefill。`can_allocate` 返回可命中的块数，`Scheduler` 据此只计算未缓存的后缀。
 
@@ -158,7 +158,7 @@ nanodeepinfer/
 
 ## 适合继续练手的扩展点
 
-- 在 `MLAAttention` 中把"上投影后算注意力"改成潜空间直接计算（`q` 吸收 `kv_b_proj` 的权重），对照 FlashMLA 的思路体会省算力的来源；
+- 把 `MLAAttention` 的潜空间注意力换成真正的 FlashMLA 内核，对照两者在显存访问上的差异；
 - 在 `ModelRunner.run` 之上加一层草稿-验证循环，即是 DSpark/MTP 投机解码的骨架；
 - 在 `Gate` 的专家循环处按 `expert_parallel_size` 切分专家并插入 all-to-all，即是 DeepEP 的位置；
 - 给 `BlockManager` 加块淘汰策略，把前缀缓存做成真正的 LRU KV 缓存池。
