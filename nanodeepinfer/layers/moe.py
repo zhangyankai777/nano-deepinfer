@@ -26,6 +26,7 @@ class Gate(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.hidden_size))
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
         if cfg.topk_method == "noaux_tc":
             self.e_score_correction_bias = nn.Parameter(torch.zeros(cfg.n_routed_experts))
         self.top_k = cfg.num_experts_per_tok
@@ -40,11 +41,13 @@ class Gate(nn.Module):
         scores = torch.sigmoid(logits) if self.scoring == "sigmoid" else torch.softmax(logits, dim=-1)
         choice = scores + self.e_score_correction_bias if hasattr(self, "e_score_correction_bias") else scores
         if self.n_group > 1:
-            g = choice.view(-1, self.n_group, choice.size(-1) // self.n_group)
+            per_group = choice.size(-1) // self.n_group
+            g = choice.view(-1, self.n_group, per_group)
             group_scores = g.topk(2, dim=-1).values.sum(-1)
             group_idx = group_scores.topk(self.topk_group, dim=-1).indices
-            mask = torch.zeros_like(g).scatter_(1, group_idx.unsqueeze(-1), 1)
-            choice = choice * mask.view(x.shape[:-1] + (-1,))
+            group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+            score_mask = group_mask.unsqueeze(-1).expand(-1, -1, per_group).reshape(x.shape[:-1] + (-1,))
+            choice = choice.masked_fill(score_mask == 0, float("-inf"))
         topk_idx = choice.topk(self.top_k, dim=-1).indices
         weights = scores.gather(-1, topk_idx)
         if self.norm_topk_prob:
@@ -69,24 +72,34 @@ class MoE(nn.Module):
         return self._stacked
 
     def _routed(self, flat: torch.Tensor, idx: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """全部专家堆叠成批量矩阵乘：无逐专家循环、无动态形状，decode 可被 CUDA graph 捕获。
+        """只计算被选中的专家：按专家排序后分组做 GEMM。
 
-        代价是每个 token 对所有专家都算一遍（靠路由权重把未选专家置零），
-        换来的是大 GEMM 与零 CPU 同步；大批量时按行分块控制中间张量大小。
+        循环次数固定为专家数（静态形状，可被 CUDA graph 捕获），
+        只算 top_k 选中的 token 组，避免对全部专家做无效计算。
         """
         gate_up, down = self._stacked_weights()
-        expert_w = torch.zeros(flat.size(0), gate_up.size(0), dtype=weights.dtype, device=flat.device)
-        expert_w.scatter_add_(1, idx, weights)
-        outs = []
-        for chunk in flat.split(1024):
-            w = expert_w[: chunk.size(0)]
-            expert_w = expert_w[chunk.size(0):]
-            h = torch.einsum("nh,eih->eni", chunk, gate_up)
+        num_tokens = flat.size(0)
+        flat_idx = idx.reshape(-1)
+        order = flat_idx.argsort(stable=True)
+        sorted_experts = flat_idx[order]
+        token_idx = order // self.gate.top_k
+        slot = order % self.gate.top_k
+        counts = torch.bincount(sorted_experts, minlength=gate_up.size(0))
+        starts = torch.zeros(gate_up.size(0), dtype=torch.long, device=flat.device)
+        starts[1:] = counts.cumsum(0)[:-1]
+        max_count = int(counts.max())
+        out = torch.zeros_like(flat)
+        for g in range(gate_up.size(0)):
+            positions = starts[g] + torch.arange(max_count, device=flat.device)
+            positions = torch.clamp(positions, max=num_tokens * self.gate.top_k - 1)
+            valid = torch.arange(max_count, device=flat.device) < counts[g]
+            tokens = token_idx[positions]
+            h = torch.nn.functional.linear(flat[tokens], gate_up[g])
             gate, up = h.chunk(2, dim=-1)
             h = torch.nn.functional.silu(gate) * up
-            out_e = torch.einsum("eni,ehi->enh", h, down)
-            outs.append(torch.einsum("enh,ne->nh", out_e, w.to(h.dtype)))
-        return torch.cat(outs) if len(outs) > 1 else outs[0]
+            h = torch.nn.functional.linear(h, down[g]) * weights[tokens, slot[positions]].unsqueeze(-1)
+            out.index_add_(0, tokens, h * valid.unsqueeze(-1))
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.view(-1, x.size(-1))

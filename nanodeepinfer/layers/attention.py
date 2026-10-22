@@ -37,15 +37,30 @@ class MLAAttention(nn.Module):
         self.kv_b_proj = nn.Linear(self.kv_rank, self.num_heads * (self.qk_nope + self.v_dim), bias=bias)
         self.o_proj = nn.Linear(self.num_heads * self.v_dim, cfg.hidden_size, bias=bias)
         self.rotary_emb = RotaryEmbedding(self.qk_rope, max_len, cfg.rope_theta)
+        self._q_in_dim = cfg.q_lora_rank if cfg.q_lora_rank is not None else self.num_heads * self.qk_dim
+        self._fused_in: tuple[torch.Tensor, torch.Tensor | None] | None = None
+
+    def _fused_in_proj(self, x: torch.Tensor) -> torch.Tensor:
+        """q 的低秩输入与 kv_a 在权重加载后拼成一次 GEMM（两者同吃 hidden 输入）。"""
+        if self._fused_in is None:
+            q_first = self.q_proj if hasattr(self, "q_proj") else self.q_a_proj
+            weight = torch.cat([q_first.weight, self.kv_a_proj_with_mqa.weight])
+            bias = None
+            if q_first.bias is not None:
+                bias = torch.cat([q_first.bias, self.kv_a_proj_with_mqa.bias])
+            self._fused_in = (weight, bias)
+        weight, bias = self._fused_in
+        return torch.nn.functional.linear(x, weight, bias)
 
     def _projections(self, x: torch.Tensor, positions: torch.Tensor):
         """返回吸收后的 q_abs、带 RoPE 的 q_pe，以及待写入缓存的潜向量。"""
+        fused = self._fused_in_proj(x)
+        q_low, kv = fused[..., : self._q_in_dim], fused[..., self._q_in_dim:]
         if hasattr(self, "q_proj"):
-            q = self.q_proj(x)
+            q = q_low
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            q = self.q_b_proj(self.q_a_layernorm(q_low))
         q = q.view(-1, self.num_heads, self.qk_dim)
-        kv = self.kv_a_proj_with_mqa(x)
         c_kv = self.kv_a_layernorm(kv[..., : self.kv_rank])
         k_pe = self.rotary_emb(kv[..., self.kv_rank:].unsqueeze(1), positions).squeeze(1)
         w = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope + self.v_dim, self.kv_rank)
